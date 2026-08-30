@@ -1,0 +1,448 @@
+**ENTERPRISE AI GOVERNANCE PLATFORM**
+
+Detailed Technical Architecture Document
+
+Version 2.0  |  Production Build Blueprint  |  August 2026
+
+| **Field** | **Value** |
+| --- | --- |
+| Document | Technical Architecture Document (TAD) — Production Edition |
+| System | Enterprise AI Governance Platform |
+| Version | 2.0 (supersedes 1.0) |
+| Status | Target production architecture + developer build guide |
+| Scope note | Describes a production re-platforming, not the current single-file bundle |
+| Audience | Engineering, DevOps/SRE, security, architecture review board |
+
+# Table of Contents
+
+# 0. How to Read This Document
+
+Version 1.0 documented the platform **as it exists today**: a single self-contained HTML file with no build step and no backend. That form is ideal for rapid review and demonstration, but it is **not** a production architecture — it has no persistence, no authenticated multi-user access, and (in standalone mode) holds credentials in the browser.
+
+**This document (2.0) describes the target production system a development team would build** to run the platform for real enterprise use. It is therefore a re-platforming blueprint. The current single-file bundle becomes the **Web SPA** tier of the target architecture (after the clean-architecture refactor), and everything else — API layer, persistence, authentication, orchestration, deployment, and operations — is new work described here in enough detail to implement.
+
+Where a choice is a recommendation rather than a fixed requirement (database engine, cloud, orchestration), it is called out as **[Decision]** so it can be ratified or substituted. The four-layer frontend architecture, the security controls, and the data model are carried forward from the platform's own design and audit and are not optional.
+
+# 1. Architecture Overview
+
+The production system is a conventional three-tier web application hardened for AI governance workloads: a React single-page application, a stateless backend API with a dedicated AI orchestration service, and a managed data tier. All AI inference is proxied server-side so that no provider credential ever reaches the browser. The following figures establish context, then progressively decompose the system.
+
+*Figure 1 — System context: actors, the platform, and external systems.*
+
+*Figure 2 — Production container architecture (C4 level 2).*
+
+Reading Figure 2 top to bottom: the browser loads the SPA over a CDN; all API traffic passes an ingress/gateway that terminates TLS, verifies the OIDC token, and applies per-user rate limits. The **Governance API** owns CRUD and business rules for governance entities. The **AI Orchestrator** is the only component that talks to the Anthropic API; it builds prompts, sanitizes input, attaches credentials, classifies errors, and writes an audit record for every call. **Async Workers** run drift detection, discovery sweeps, notification delivery, and report generation off the request path. State lives in PostgreSQL (system of record), Redis (cache and job queue), and an object store (artifacts, evidence, and an immutable/WORM audit log).
+
+# 2. Technology Stack
+
+Versions are current-stable recommendations as of the document date; pin exact versions in a lockfile at implementation time and verify against the latest security advisories. Items marked [Decision] are substitutable.
+
+## 2.1 Frontend
+
+| **Concern** | **Choice** | **Notes** |
+| --- | --- | --- |
+| Framework | React 18 + TypeScript 5 | Carried from the current bundle; strict mode on. |
+| Build tool | Vite 5 [Decision] | Fast HMR, ESM, first-class TS; replaces the no-build single file. |
+| Styling | Tailwind CSS 3 + shadcn/ui | House style; full utility set (removes the bundled-subset constraint). |
+| State | Feature hooks + React Context/useReducer | Per the four-layer plan; add TanStack Query for server cache [Decision]. |
+| Routing | React Router 6 [Decision] | Route-per-module; lazy-loaded feature chunks. |
+| Testing | Vitest + React Testing Library + Playwright | Unit, component, and end-to-end. |
+
+## 2.2 Backend
+
+| **Concern** | **Choice** | **Notes** |
+| --- | --- | --- |
+| Runtime / language | Node.js 20 LTS + TypeScript [Decision] | Shares types with the frontend via a common package; Python/Go are viable alternatives. |
+| API framework | NestJS or Fastify [Decision] | Structured modules, DI, validation, OpenAPI generation. |
+| Validation | Zod (shared schemas) | One schema validates API input and generates TS types. |
+| ORM / DB access | Prisma or Drizzle [Decision] | Typed queries, migrations as code. |
+| AI SDK | Official Anthropic SDK (server-side) | Never in the browser; holds the API key. |
+| Auth | OIDC (Authorization Code + PKCE) | Integrates enterprise IdP; JWT access tokens, short TTL. |
+| Jobs | BullMQ on Redis [Decision] | Drift, discovery, notifications, report generation. |
+
+## 2.3 Data & Platform
+
+| **Concern** | **Choice** | **Notes** |
+| --- | --- | --- |
+| System of record | PostgreSQL 16 [Decision] | Relational integrity for governance entities; JSONB for flexible evidence. |
+| Cache / queue | Redis 7 | Session cache, rate-limit counters, job queue. |
+| Object storage | S3-compatible, versioned | Artifacts, evidence, WORM audit log (object-lock). |
+| Secrets | Vault or cloud KMS | API keys, DB creds; rotation; no secrets in images or client. |
+| Runtime | Containers on Kubernetes [Decision] | Or a managed container/PaaS for smaller footprints. |
+| IaC | Terraform + Helm [Decision] | Reproducible environments; GitOps optional. |
+| Observability | OpenTelemetry → metrics/logs/traces | Vendor-neutral; wire to your existing backend. |
+
+# 3. Frontend Architecture (Buildable Detail)
+
+The frontend is the current bundle, refactored into four layers with strict downward dependency. This is the same plan approved in v1.0, restated here as build guidance.
+
+*Figure 3 — Frontend clean architecture: four layers, dependencies point downward only.*
+
+## 3.1 Layer Responsibilities
+
+- **Domain (src/domain/). **Pure TypeScript types/enums — UseCase, Incident, Framework, AIModel, Vendor, AgentTask. No React, no fetch. Defined once, imported everywhere. Shared with the backend via a common package so client and server cannot drift.
+
+- **Lib ****&**** Store (src/lib/, src/store/). **The API client (one typed request function per resource), the security helpers (sanitizeForPrompt), UI tokens/formatters, and the useReducer-based AppContext that replaces ~40 of the 75 scattered useState calls.
+
+- **Feature Hooks (features/*/use*.ts). **Business logic and state per feature; components stay render-only. Each AI action holds an AbortController in a ref, cancels in-flight duplicates, and cleans up on unmount.
+
+- **Presentation (features/*/ components). **The 16 module UIs plus shared components (Sidebar, StatusBadge, RiskDot, ErrorBoundary). No feature imports another feature's state.
+
+## 3.2 Project Layout
+
+src/
+
+  domain/        useCase.ts incident.ts compliance.ts model.ts vendor.ts agent.ts
+
+  lib/
+
+    api/         client.ts (typed fetch) resources.ts (per-entity calls)
+
+    security/    sanitize.ts
+
+    ui/          tokens.ts tone.ts
+
+  store/         AppContext.tsx  actions.ts
+
+  features/      <module>/  <Module>.tsx  use<Module>.ts  components/
+
+  components/    Sidebar StatusBadge RiskDot ErrorBoundary EmptyState
+
+  main.tsx  App.tsx
+
+## 3.3 Server-Data Pattern
+
+Replace inlined seed data with server calls behind a typed client. Reads go through a query cache (TanStack Query) keyed by entity; writes invalidate the relevant keys. AI features never call the provider directly — they call the backend AI Orchestrator endpoint.
+
+// features/incidents/useIncidents.ts (shape)
+
+const q = useQuery(['incidents'], () => api.incidents.list());
+
+const analyze = useMutation((id: string) =>
+
+  api.ai.analyzeIncident(id, { signal: controller.signal }));
+
+// server does sanitize + Anthropic call + audit; client only renders result
+
+# 4. AI Orchestration & the Hardened Call Path
+
+Every AI feature routes through a single server-side orchestrator. Moving the provider call server-side is what makes the platform safe to deploy for real users: the API key lives in the secrets manager, input is sanitized centrally, and every call is audited.
+
+*Figure 4 — Hardened AI call sequence, applied to all AI call sites.*
+
+## 4.1 Orchestrator Responsibilities
+
+- Authorize the request against the caller's role and the target resource.
+
+- Sanitize every user-controlled field (escape, length-cap, filter injection patterns); place instructions in the system prompt and data in the user prompt.
+
+- Attach credentials (x-api-key, anthropic-version) from the secrets manager and enforce a per-user rate limit.
+
+- Call the Anthropic Messages API with an AbortSignal; support cancellation from the client.
+
+- Classify the outcome (auth_failure / rate_limit / provider_error / client_error) and return a typed, operator-actionable result.
+
+- Write an immutable audit record: who, when, which feature, model, token counts, and outcome — never the raw secret.
+
+## 4.2 Endpoint Contract (example)
+
+POST /api/v1/ai/incidents/{id}/analyze      (auth: Bearer JWT)
+
+-> 200 { text, model, usage:{input,output}, requestId }
+
+-> 401 { errorType:'auth_failure', message }
+
+-> 429 { errorType:'rate_limit',  retryAfterSec }
+
+-> 502 { errorType:'provider_error', message }
+
+ 
+
+Server request to provider (never exposed to client):
+
+POST https://api.anthropic.com/v1/messages
+
+headers: x-api-key <secret>, anthropic-version 2023-06-01
+
+body: { model:<resolved from config>, max_tokens, system, messages:[{role:'user',content:<sanitized>}] }
+
+**MCP and web-search tools** (used by AI-powered features) attach as server-side tool definitions on the provider request; the browser never sees connector URLs or tool credentials.
+
+## 4.3 Configurable Model Selection
+
+The model is a **configuration parameter, not a hardcoded literal**. No AI call site names a model directly; each resolves the model at request time from configuration. This lets operators adopt newer models without a code change, run A/B comparisons, and route different task types to different models for cost and quality.
+
+- **Where it is set. **In the SPA, under Platform Settings → AI Models & APIs (persisted with the rest of the AI configuration). In production, the AI Orchestrator reads a default model from an environment variable (e.g. GOV_AI_MODEL) and accepts a per-request override from an authorized caller.
+
+- **Resolution order. **explicit per-request override (authorized) → configured default (Settings / env) → a safe fallback constant. If the configured model is rejected by the provider, the orchestrator returns a typed provider_error rather than silently substituting.
+
+- **Hosted-preview caveat. **When the SPA runs inside a hosted preview environment that proxies the provider, that environment may pin the model regardless of the setting. Free model choice requires the standalone/production topology where the orchestrator holds the key. The Settings UI states this inline.
+
+**Recommended per-task routing.** Defaults below balance quality against cost; treat them as a starting policy, not a mandate. Verify exact model IDs against Anthropic's current model overview before pinning, as the lineup changes.
+
+| **Governance task** | **Default model** | **Escalate to** | **Why** |
+| --- | --- | --- | --- |
+| Executive summary / ops briefing | Sonnet 5 | — | Strong knowledge-work quality at low cost; high volume. |
+| Risk assessment drafting | Sonnet 5 | Opus (hard cases) | Structured reasoning over supplied context. |
+| Incident analysis (control mapping) | Sonnet 5 | Opus | Escalate when spanning many systems/controls. |
+| Compliance remediation guidance | Sonnet 5 | — | Grounded rewriting against a control; cost-sensitive. |
+| Guardrail / red-team reasoning | Opus | — | Adversarial reasoning benefits from the most capable tier. |
+| Discovery triage / bulk classification | Haiku 4.5 | Sonnet 5 | High volume, latency- and cost-sensitive. |
+| AI Assistant (interactive chat) | Sonnet 5 | user-selectable | Good default; let power users pick per session. |
+
+**Implementation note. **Because token accounting differs across model generations, expose max_tokens and the rate limit alongside the model in the same configuration block, and re-measure cost after any model change rather than assuming parity.
+
+# 5. Data Architecture
+
+PostgreSQL is the system of record. The conceptual model below carries the platform's domain into relational tables; flexible payloads (evidence blobs, model-card sections) use JSONB columns, while relationships that drive queries and integrity are first-class foreign keys.
+
+*Figure 5 — Core data model. Entity attributes are indicative, not exhaustive.*
+
+## 5.1 Table & Key Guidance
+
+| **Table** | **Notes for implementation** |
+| --- | --- |
+| use_case | PK id (uuid). FKs to owner (user), business_unit. Enum columns: stage, eu_ai_act_tier. Numeric risk fields. Row-level history via audit trigger. |
+| ai_model | PK id. Cost as numeric. 1:1 model_card, 1:N drift_metric. FK vendor_id. |
+| guardrail_run | PK id. FK use_case_id. JSONB test_results (per-class pass/warn/block). sign_off_by/at. Gates use_case.stage transitions. |
+| incident | PK id. Enum severity, status. reporting_deadline (timestamptz, nullable). FK related_model_id. created_at/updated_at. |
+| alert | PK id. FK system. May reference the incident it escalated to. |
+| framework / control | control rows FK framework. status enum. evidence JSONB or FK to object-store keys. coverage computed. |
+| agent | PK id. autonomy_level enum, action_groups JSONB, caps int, approval_mode enum. autonomy_change audit table. |
+| audit_log | Append-only. Written by DB triggers and the orchestrator. Mirrored to WORM object storage for tamper evidence. |
+
+## 5.2 Migrations & Seeding
+
+- Schema changes ship as versioned, reversible migrations run in CI against an ephemeral database before production.
+
+- Seed/demo data becomes an idempotent seeding script (for non-production environments only), replacing the object literals inlined in the current bundle.
+
+- Backups: automated snapshots plus point-in-time recovery (PITR); test restores on a schedule.
+
+# 6. Security Architecture
+
+The v1.0 audit produced 8 findings, all remediated in the current bundle. In the production topology those controls move to their proper tier — most importantly, credentials and privileged calls move entirely server-side. Figure 7 maps each control to the finding it addresses (V01–V08).
+
+*Figure 7 — Security architecture and trust boundaries, with control-to-finding mapping.*
+
+## 6.1 Control Summary
+
+| **ID** | **Finding** | **Production control** |
+| --- | --- | --- |
+| V01 | No CSP | Strict CSP; connect-src limited to the app API; frame-src/object-src none. |
+| V02 | Missing API auth (critical if standalone) | Gateway verifies OIDC; the orchestrator holds the provider key from KMS — client never authenticates to the provider. |
+| V03 | Prompt injection | Central sanitizeForPrompt(); system/user prompt separation on every call. |
+| V04 | No cancellation / flood risk | AbortController per call + server per-user rate limit + queue backpressure. |
+| V05 | Keys in React state | No secrets in the browser at all; only short-lived JWTs. Standalone fallback uses sessionStorage + Web Crypto, documented but not preferred. |
+| V06 | Silent error swallowing | Typed error classification + structured logs/traces to the observability backend. |
+| V07 | No error boundaries | React ErrorBoundary per route + global window handlers; server maps errors to problem+json. |
+| V08 | Unsandboxed artifact preview | Preview iframes sandboxed (allow-scripts, no-referrer); rendered content treated as untrusted. |
+
+## 6.2 AuthN / AuthZ
+
+- **Authentication: **OIDC Authorization Code + PKCE against the enterprise IdP; the gateway validates the JWT on every request; tokens are short-lived with refresh.
+
+- **Authorization (RBAC): **roles map to permissions; a decision is made on every write and on sensitive reads. Approval actions (committee decisions, guardrail sign-off, autonomy changes, risk acceptance) are restricted to the accountable roles and recorded with the actor's identity.
+
+- **Secrets: **provider keys and DB credentials live in Vault/KMS with rotation and least-privilege; egress is allow-listed to api.anthropic.com.
+
+# 7. Deployment Architecture
+
+The reference topology runs the tiers as containers in a Kubernetes namespace with managed data services alongside. It is cloud-agnostic; a smaller deployment can collapse the same components onto a managed container platform.
+
+*Figure 6 — Deployment topology (reference).*
+
+## 7.1 Environments & Rollout
+
+- Environments: dev → staging → production, each fully IaC-provisioned and isolated (separate data, secrets, and egress policy).
+
+- Rollout: blue/green or rolling deploys with readiness/liveness probes and automatic rollback on failed health checks.
+
+- Database migrations run as a gated pipeline step with a dry-run against a staging clone before production apply.
+
+- Autoscaling: HPA on the API and orchestrator by CPU and request latency; workers scale on queue depth.
+
+## 7.2 Availability & DR
+
+- Multi-AZ managed Postgres and Redis; object storage with cross-region replication for the audit log.
+
+- Defined RPO/RTO targets [Decision]; PITR for the database; periodic restore drills.
+
+- Graceful degradation: governance browse/record/report remain available when the Anthropic API is unreachable; AI features surface typed errors.
+
+# 8. Observability & Operations
+
+- **Metrics: **request rate/latency/error by endpoint; AI call latency, token usage, and cost per feature; queue depth; DB connection health.
+
+- **Logs: **structured JSON with a correlation/request id propagated from the gateway through the orchestrator to the provider call.
+
+- **Traces: **OpenTelemetry spans across gateway → API → orchestrator → provider, so a slow AI response is attributable to a tier.
+
+- **Alerting: **on error-rate and latency SLOs, auth failures, rate-limit saturation, drift-job failures, and audit-write failures (treated as high severity).
+
+- **Cost governance: **per-feature token/cost dashboards feed the platform's own Command Center metrics.
+
+# 9. Build & Delivery Pipeline
+
+A single pipeline takes a commit to production through quality and security gates. Any gate failure stops the release.
+
+*Figure 8 — CI/CD pipeline with quality and security gates.*
+
+## 9.1 Gate Detail
+
+| **Stage** | **Checks (must pass)** |
+| --- | --- |
+| Commit / PR | ESLint, tsc --noEmit, unit tests (Vitest), commit-lint; PR review required. |
+| Build | Vite production build; generate SBOM; sign artifacts/images. |
+| Test | Integration tests against ephemeral DB; Playwright e2e; accessibility checks. |
+| Security | SAST, dependency and container image scans, secret scanning; fail on high severity. |
+| Stage | Deploy to ephemeral/staging env; smoke tests; migration dry-run against staging clone. |
+| Approve | Manual approval gate; change record created and linked. |
+| Production | Blue/green deploy; run DB migration; health-gated cutover; rollback ready. |
+
+# 10. Key Business Logic
+
+## 10.1 Use Case Lifecycle Enforcement
+
+The use-case lifecycle is enforced server-side as a state machine so gates cannot be bypassed by a client. Transitions that lack the required evidence are rejected by the API, not just hidden in the UI.
+
+*Figure 9 — Use-case lifecycle state machine with enforced gates.*
+
+- Advancement to Testing→Under Review requires a linked guardrail_run with an overall pass and a recorded sign-off.
+
+- Advancement to Approved requires a committee decision record; Production requires Approved plus the guardrail gate satisfied.
+
+- Rejected / Needs Revision returns the use case to an earlier stage with the decision rationale retained for audit.
+
+## 10.2 Composite Risk Index (Command Center)
+
+The Command Center summarizes enterprise AI risk posture for executives as a single **composite risk index on a 0–100 scale, where higher means higher risk**. It is derived entirely from live governance data. Because a black-box score erodes trust in a governance tool, the index is subject to a hard transparency rule: the dashboard always renders the weighted contribution of each component alongside the score, so any value is explainable on sight.
+
+**Definition. **The index is a weighted sum of three bounded sub-scores computed from open incidents, guardrail monitors, and unresolved alerts:
+
+riskIndex = round( 0.45 * incidentScore
+
+                 + 0.35 * guardrailScore
+
+                 + 0.20 * alertScore )          // 0..100, higher = worse
+
+ 
+
+incidentScore  = min(100, critical*40 + high*18 + medium*7 + low*3)  // open incidents by severity
+
+guardrailScore = min(100, breaches*30 + warnings*12)                 // guardrail monitors
+
+alertScore     = min(100, activeAlerts*18)                           // unresolved, unacknowledged
+
+| **Component** | **Weight** | **Formula (capped at 100)** | **Source data** |
+| --- | --- | --- | --- |
+| Incident load | 45% | critical×40 + high×18 + medium×7 + low×3 | Open incidents grouped by severity |
+| Guardrail load | 35% | breaches×30 + warnings×12 | Guardrail monitors in breach / warn |
+| Alert load | 20% | activeAlerts×18 | Alerts unresolved and unacknowledged |
+
+| **Band** | **Range** | **Executive meaning** |
+| --- | --- | --- |
+| Healthy | 0–39 | Posture within tolerance; no immediate action. |
+| Elevated | 40–70 | Attention required; review contributing drivers. |
+| Critical | 71–100 | Immediate action; escalate per policy. |
+
+**Production requirements.** The index moves from a per-browser client computation (its form in the single-file build) to an authoritative server-side computation:
+
+- **Single source of truth. **Computed once server-side per refresh so every viewer sees the same value; not recomputed independently in each browser.
+
+- **Auditable. **Each computed value is written to the audit log with its inputs and the weighting version, so any displayed score is reproducible after the fact.
+
+- **Transparency enforced. **The API returns the component contributions with the score; clients must display them. A score without its breakdown is not an acceptable rendering.
+
+- **Governance-owned parameters. **The weights (45/35/20) and per-severity points are risk policy owned by the Risk function, held in configuration and change-controlled — never hardcoded constants. Changes are versioned so historical scores remain interpretable.
+
+- **Calibration caveat. **The scale and band thresholds are provisional defaults. Calibrate against several weeks of real data before using the bands to trigger escalation, and record the calibration decision.
+
+- **Extensibility. **Additional signals — compliance-coverage gap, model-drift breaches, vendor risk — can be added as further weighted components. Keep the weights summing to 1 and keep the per-component breakdown visible.
+
+## 10.3 Regulatory Scope Classification
+
+Users cannot reliably self-declare regulatory scope, so the platform **infers it** from a plain-language screening questionnaire at use-case registration. Answers about what the system does and to whom feed a rules engine that returns a provisional scope. The output is never a legal verdict — it is a provisional classification with a mandatory review gate for the most serious tier.
+
+**Screens (plain-language inputs). **Applicability (does it affect people in the EU); prohibited-practice red flags (EU AI Act Art. 5); high-risk domains (Annex III — employment, essential services, education, biometrics, critical infrastructure, law enforcement, migration, justice, regulated-product safety); transparency triggers (Art. 50 — chatbot, synthetic media, emotion/biometric categorization); and model/data (GPAI provider; personal / special-category data; automated decisions with significant effect).
+
+**Output. **A provisional tier (Prohibited / High / Limited / Minimal), a GPAI flag, mapped scopes (EU AI Act tier, GDPR overlaps), a traceable rationale (each result points to the answer that triggered it), and an obligations checklist for the tier.
+
+- **Transparency. **The classification always renders its rationale and the triggering answers; a bare tier is not an acceptable output.
+
+- **Over-classify on ambiguity. **When answers are unclear, route to review rather than clearing; a false Minimal is more dangerous than a false High.
+
+- **Prohibited leads to a block. **A prohibited-practice flag registers the use case but places it in the Blocked state (Section 10.4), rather than allowing it to proceed.
+
+- **Re-screen on change. **If purpose, data, or geography changes, the screen re-runs and the tier is recomputed.
+
+**Production requirements. **The trigger logic is a versioned rules pack owned by Compliance/Legal — content, not code — so it can be updated as law changes (the EU AI Act's high-risk timeline moved 16 months in a single amendment). The engine runs server-side; results and the rules-pack version are recorded with the use case; and every screen output carries a not-legal-advice notice. Legal validates the question set and mapping before it drives decisions.
+
+## 10.4 Legal-Review Resolution Workflow
+
+A use case flagged as a prohibited practice (Section 10.3) is registered but enters a **Blocked — legal review** state: risk is set to Critical and lifecycle advancement is locked. The block is not a dead end — it is resolved by an authorized reviewer through a defined state machine.
+
+*Figure 10 — Legal-review resolution states and transitions.*
+
+### 10.4.1 States and Transitions
+
+| **From** | **Action** | **Guard** | **To / Effect** |
+| --- | --- | --- | --- |
+| Screening | Register | Classifier returns Prohibited | Blocked (Critical; lifecycle locked) |
+| Screening | Register | Not prohibited | Active (normal lifecycle) |
+| Blocked | Clear — reviewed & permitted | Authorized reviewer; reviewer is not the owner; rationale present | Active; block lifted; risk recomputed; lifecycle resumes |
+| Blocked | Uphold — confirm prohibited | Authorized reviewer; reviewer is not the owner; rationale present | Retired (terminal); kept out of production |
+| Blocked | Reclassify (extension) | Authorized reviewer | Re-run screening; tier recomputed; block lifted if no longer prohibited |
+
+### 10.4.2 Separation of Duties
+
+- **Reviewer role. **Only members of the AI Legal Reviewers role may resolve a block. Enforced server-side by RBAC in production; the single-file build enforces the workflow but not identity.
+
+- **Owner exclusion. **The use-case owner cannot resolve their own block. The reviewer must be a different, named individual — a hard guard on both Clear and Uphold.
+
+- **No self-service. **Registration and resolution are distinct authorities; the person who registered a use case cannot clear its legal block.
+
+### 10.4.3 Audit
+
+- **Every resolution is recorded. **Reviewer identity, timestamp, decision (cleared / upheld / reclassified), and a mandatory rationale are written to the immutable audit log and retained on the use-case record.
+
+- **Original context preserved. **The classifier's block rationale and mapped scopes are retained after resolution — the record shows it was blocked, why, who resolved it, and on what basis. Nothing is deleted.
+
+- **Reproducible. **Because the rules-pack version is recorded (Section 10.3), a past classification and its resolution can be reconstructed even after the rules change.
+
+### 10.4.4 Production Requirements
+
+- **Server-side gate. **The lifecycle lock and the reviewer authorization are enforced by the API, not the client — a blocked use case cannot be advanced by manipulating the browser.
+
+- **Reviewer notification and aging. **Blocked use cases notify the AI Legal Reviewers queue and track age against an SLA, so items do not sit in limbo.
+
+- **Immutable trail. **Resolution records are append-only; corrections are new entries, never edits.
+
+# 11. Build Sequence for the Development Team
+
+- Stand up the domain package (shared types) and the four-layer frontend skeleton; refactor the current bundle module-by-module behind the typed API client, keeping behavior identical.
+
+- Build the Governance API and PostgreSQL schema for the highest-value entities first (use cases, incidents, inventory), with migrations and RBAC.
+
+- Build the AI Orchestrator and move all AI call sites behind it; implement sanitize, rate-limit, abort, error classification, and audit.
+
+- Add OIDC auth at the gateway and wire RBAC decisions; remove any client-side key handling.
+
+- Add async workers (drift, discovery, notifications, reports) and the object store for artifacts and the WORM audit log.
+
+- Provision environments with IaC; wire observability; complete the CI/CD gates; run a security review against V01–V08 in the new topology.
+
+- Load/performance test the AI path (rate limits, backpressure), run DR restore drills, then production cutover.
+
+# 12. Open Decisions to Ratify
+
+| **Decision** | **Default recommended** | **Why it matters** |
+| --- | --- | --- |
+| Backend language/framework | Node 20 + NestJS/Fastify + TS | Type-sharing with frontend; team skills may favor Python/Go. |
+| Database | PostgreSQL 16 | Relational integrity + JSONB flexibility. |
+| Runtime platform | Kubernetes + Helm | Scale and portability vs. operational overhead for small teams. |
+| Server-cache library | TanStack Query | Simplifies read caching and invalidation. |
+| RPO/RTO targets | To be set with Risk | Drives DR spend and replication topology. |
+| Persistence for standalone mode | Discouraged | If required, define storage adapter + client-side crypto explicitly. |
+
+Enterprise AI Governance Platform  |  Page

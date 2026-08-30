@@ -1,0 +1,162 @@
+**Enterprise AI Governance Platform**
+
+**Developer ****&**** Production-Readiness Guide**
+
+What the current build is, and what to engineer to run it in production
+
+Version 1.0  ·  Read with the Integration Reference Architecture and the AI Governance Framework
+
+**Contents**
+
+# **1. Purpose ****&**** Audience**
+
+This guide is for the engineering team turning the AI Governance Platform demonstrator into a production system. It states plainly **what exists today**, **what must be built**, and a **sequence** to build it. Detailed integration contracts are in the Integration Reference Architecture; the control requirements are in the AI Governance Framework.
+
+# **2. Current Build Overview**
+
+The platform is a **single-file React application** (~1.1 MB) that runs entirely in the browser. It calls the AI model API at runtime through a fetch wrapper, holds state in React with local persistence, and inlines a spreadsheet engine for Excel import/export. A content-security policy restricts outbound connections.
+
+## **2.1 What is implemented (control plane)**
+
+- **Governance modules: **use cases & lifecycle, discovery, inventory, model cards / bias / lineage / drift, guardrails, red-team, agentic oversight, approvals, policies, compliance, monitoring, incidents, artifacts.
+
+- **Data layer: **13 persisted domains with normalizers; Excel import/export (merge-by-id); JSON config backup.
+
+- **Controls surface: **role-based access (3 roles + permission matrix), an audit trail for config/security events.
+
+- **Bridges: **guardrail-to-gateway policy export (LiteLLM/OPA/JSON); a custom connector framework (definition + builder); data-governance findings ingestion into Monitoring.
+
+## **2.2 Constraints to engineer around**
+
+| **Area** | **Current build** | **Implication** |
+| --- | --- | --- |
+| Backend | None — browser-only | No shared state, no server enforcement |
+| Persistence | Browser-local (localStorage) | Per-device, per-browser; not multi-user |
+| RBAC | UI-level only | Client-side; not a security boundary |
+| Audit | Local, editable | Not tamper-evident or authoritative |
+| Enforcement | Modelled (policy export) | No runtime interception of AI traffic |
+| Integrations | Defined, Disconnected | No live data flow; CSP blocks egress |
+| AI calls | Direct from browser | No gateway; no central logging |
+
+# **3. Target Production Architecture**
+
+Production separates into four planes; the current build is the control-plane UI only. The other three must be engineered.
+
+| **Plane** | **Role** | **Build status** |
+| --- | --- | --- |
+| Control | Author policy/risk; view posture (this UI, re-pointed at the backend) | Reuse UI; add backend client |
+| Data / Enforcement | Intercept & enforce on live AI traffic | Build: gateway/sidecar + policy compile |
+| Integration / Ingestion | Exchange signals with the toolchain | Build: connector runtimes + event bus |
+| Backend / Trust | Identity, storage, immutable audit | Build: services, DB, IdP, audit store |
+
+# **4. Build-Out Requirements**
+
+## **4.1 Backend ****&**** API**
+
+Replace browser-local state with backend services exposing a REST/GraphQL API. The existing 13 data domains become the backend schema; the React UI is re-pointed from local persistence to the API. All mutations move server-side and become the enforcement point for RBAC and audit.
+
+## **4.2 Identity ****&**** Access**
+
+Integrate an enterprise IdP (**Entra ID / OIDC**). Map the three platform roles to IdP groups and enforce RBAC **server-side** on every mutation — the UI checks become advisory. For the semiconductor edition, the IdP also supplies nationality/region/screening attributes consumed by the export access-decision (§Framework 18).
+
+## **4.3 Datastore**
+
+| **Store** | **Purpose** |
+| --- | --- |
+| Relational DB | Use cases, guardrails, policies, inventory, incidents, connectors |
+| Object store | Model cards, reports, evidence artifacts |
+| Append-only log store | Immutable, tamper-evident audit (hash-chained / WORM) |
+| Secret vault | Connector and gateway credentials (never in app config) |
+
+## **4.4 Enforcement Plane**
+
+Deploy an **LLM gateway** (or service-mesh sidecar) in the AI request path. Build a **policy-compilation service** that consumes the platform’s guardrail export and pushes gateway config on every change (GitOps or config API). Add a **PDP** (e.g. OPA) for guardrail and access decisions; the gateway is the PEP. All AI traffic routes through it for enforcement and central logging.
+
+## **4.5 Connector Runtime**
+
+Implement the **runtime-adapter contract** (Integration Reference Architecture §6.2) per connection type (REST, JDBC, webhook, SFTP, MQ, gRPC). Connector definitions authored in the UI are provisioned by this runtime: credential binding via vault, connection test, scheduling/listeners, normalize-and-route to the target domain. Prioritize Microsoft (Entra/Purview/DSPM/MIP/IRM) and data-governance connectors for IP protection.
+
+## **4.6 Immutable Audit**
+
+Replace the local audit list with a server-side, append-only, tamper-evident store (hash-chaining or WORM storage). Log every governance, configuration, security, and access-decision event with actor, timestamp, and context. This satisfies EU AI Act Art. 12 and SOC 2 expectations the current build cannot.
+
+## **4.7 Monitoring ****&**** Telemetry**
+
+Build an inference-logging pipeline (every call: prompt, response, model+version, user/agent, trace ID, tool calls, guardrail results) feeding the monitoring dimensions in the Framework (§11). Wire alerting/escalation with SLAs, and ingest external signals (SIEM/CASB/DLP/data-governance) via the connector runtime instead of file upload.
+
+## **4.8 IP ****&**** Export Controls (semiconductor)**
+
+Build the IP asset register service (populated from Purview/DSPM/MIP), IP-aware DLP (pattern + semantic + fingerprint) at the gateway, and the export access-decision PDP consuming IdP nationality/region attributes and a license store. See the Semiconductor Edition §§14–18.
+
+# **5. Migration Path from the Demonstrator**
+
+| **Reuse largely as-is** | **Rebuild server-side** |
+| --- | --- |
+| Domain model / schemas (13 domains) | Persistence and all mutations |
+| React UI components (as the client) | RBAC enforcement |
+| Guardrail → gateway compilation logic | Audit (immutable) |
+| Connector definition schema & builder UI | Connector execution (runtime adapters) |
+| Excel import/mapping logic | AI calls (route via gateway) |
+| Report/artifact templates | Monitoring telemetry pipeline |
+
+*The data model is the biggest reusable asset: the 13 domains, their fields, and the normalizers already define the backend schema and validation.*
+
+# **6. Security ****&**** Compliance Engineering**
+
+- **Gateway-enforced controls: **implement the OWASP LLM Top 10 controls (Framework §9) as gateway guardrails; sanitize output; rate/budget limits; extraction defense.
+
+- **Secrets ****&**** crypto: **vault-backed secrets, mTLS service-to-service, TLS + at-rest encryption with KMS.
+
+- **Isolation: **sandbox tool/code execution; egress allowlists; tenant isolation.
+
+- **Evidence: **emit control evidence automatically for continuous control monitoring (Framework §13).
+
+# **7. Non-Functional Requirements**
+
+| **NFR** | **Consideration** |
+| --- | --- |
+| Availability | Gateway is in the AI request path — design for HA and graceful degradation (fail-closed for high-risk) |
+| Latency | Guardrail checks add per-call latency — budget and parallelize pre/post-call checks |
+| Scale | Inference logging and telemetry volume can be large — stream and tier storage |
+| Residency | Country-of-processing routing for controlled data and regional data-protection rules |
+
+# **8. Recommended Build Sequence**
+
+| **Phase** | **Delivers** | **Unlocks** |
+| --- | --- | --- |
+| 1. Trust foundation | Backend + API, Entra identity, server-side RBAC, immutable audit | A real multi-user system of record |
+| 2. Enforcement | Gateway + policy compilation + PDP | Guardrails actually enforced |
+| 3. Integrations | Connector runtimes (Microsoft & data-gov first) | Live signals; IP-asset inputs |
+| 4. IP & export | IP asset register, IP-aware DLP, export access-decision | Semiconductor trade-secret & export controls |
+| 5. Observability | Full telemetry, alerting, continuous control monitoring | Operational assurance & evidence |
+
+*Each phase is independently valuable. Phases 1–2 convert the demonstrator into an enforcing system; phases 3–4 deliver the semiconductor-specific protections.*
+
+# **9. Known Limitations (current build)**
+
+- Single-file, browser-only; no backend or shared state.
+
+- RBAC and audit are client-side and not security boundaries.
+
+- Monitoring reads representative data; no live telemetry.
+
+- Guardrail enforcement and integrations are modelled, not live (CSP blocks external egress by design).
+
+- AI calls go directly from the browser with no central gateway or logging.
+
+| **Bottom line. **The demonstrator is an accurate, above-bar blueprint of the governance control plane and its data model. It is not an operational or compliant system on its own; the work in §§4 and §8 is what makes it one. |
+| --- |
+
+# **Appendix. Reference Tech Choices (non-prescriptive)**
+
+| **Concern** | **Options (illustrative)** |
+| --- | --- |
+| API / backend | Node/TypeScript or Python service; REST or GraphQL |
+| Identity | Microsoft Entra ID (OIDC), custom security attributes |
+| Gateway | LiteLLM, Portkey, Kong AI Gateway, Cloudflare AI Gateway |
+| Policy engine (PDP) | Open Policy Agent (Rego) |
+| Datastore | PostgreSQL + object store; append-only/WORM for audit |
+| Secrets | HashiCorp Vault or cloud secret manager |
+| Telemetry | OpenTelemetry-based logging/metrics pipeline |
+
+*These are illustrative; select per your platform standards. The architecture, not the vendor, is what matters.*
